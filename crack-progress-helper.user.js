@@ -1,13 +1,12 @@
 // ==UserScript==
 // @name         크랙 경과 정리기
 // @namespace    crack-progress-helper
-// @version      1.10.1
+// @version      1.11.0
 // @description  크랙 롤플레이의 턴 수를 세다가 경과를 정리할 때가 되면 알려 주고, 대화 기록을 AI에게 맡길 정리 요청 파일로 만들어 줍니다. AI 답을 붙여 넣으면 경과를 크랙 자동 장기기억 칸에 바로 넣고(되돌리기 가능), 상태창이 작품 원래 모양에서 벗어나면 알려 줍니다. 작품마다 설정을 따로 기억해 어느 작품에서나 씁니다.
 // @match        https://crack.wrtn.ai/*
 // @homepageURL  https://github.com/LikeGale/crack-chat-helper
 // @updateURL    https://raw.githubusercontent.com/LikeGale/crack-chat-helper/main/crack-progress-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/LikeGale/crack-chat-helper/main/crack-progress-helper.user.js
-// @require      https://cdn.jsdelivr.net/gh/milkyway0308/crystallized-chasm@crack-shared-core@v1.0.0/crack/libraries/crack-shared-core.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
@@ -1288,59 +1287,64 @@
   // 크랙에만 맞춰진 부분은 모두 여기 있다. 다른 플랫폼으로 옮길 때는 이 파일(과 crack.meta.js)만 새로 만들고
   // 아래 끝의 P와 같은 이름·모양으로 내놓으면 된다. 약속은 src/platforms/README.md에 적어 두었다.
   // ---------------------------------------------------------------------------
-  function CU() { return typeof CrackUtil !== 'undefined' ? CrackUtil : (W.CrackUtil || null); }
-  function chatId() { try { const c = CU(); return c ? (c.path().chatRoom() || null) : null; } catch (e) { return null; } }
-  function workIdOf(chatIdValue) {
-    try { const c = CU(); const w = c && c.path && c.path().character ? c.path().character() : null; return w || chatIdValue; } catch (e) { return chatIdValue; }
+  // 크랙과 주고받는 부분은 다른 스크립트(라이브러리)를 빌리지 않고 여기서 직접 한다.
+  // 로그인 토큰은 크랙 쿠키 access_token, 채팅방·작품 id는 주소에서 읽는다.
+  // (시험 페이지만 W.__cphCrackEnv로 주소와 토큰을 흉내 낸다)
+  const testEnv = () => W.__cphCrackEnv || null;
+  function pathname() { const e = testEnv(); return e && e.path ? e.path() : location.pathname; }
+  function cookie(key) {
+    const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + key.replace(/[.$?*|{}()[\]\\/+^]/g, '\\$&') + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function authToken() { const e = testEnv(); return (e && e.token ? e.token() : cookie('access_token')) || null; }
+  // 채팅 화면 주소: /stories/<작품>/episodes/<채팅방>, /characters/<작품>/chats/<채팅방>, 예전 /u/<작품>/c/<채팅방>
+  const CHAT_PATH = /^\/(?:stories\/([\w-]+)\/episodes|characters\/([\w-]+)\/chats|u\/([\w-]+)\/c)\/([\w-]+)/;
+  function pathIds() { const m = String(pathname() || '').match(CHAT_PATH); return m ? { work: m[1] || m[2] || m[3], chat: m[4] } : null; }
+  function chatId() { const p = pathIds(); return p ? p.chat : null; }
+  function workIdOf(chatIdValue) { const p = pathIds(); return (p && p.work) || chatIdValue; }
+
+  // 크랙에 로그인한 채로 요청. 실패하면 status가 붙은 Error를 던진다. 빈 본문은 빈 객체로
+  async function api(method, url, body) {
+    const token = authToken();
+    if (!token) throw new Error('로그인 정보를 찾지 못했어요. 페이지를 새로고침해 보세요.');
+    let res;
+    try {
+      res = await fetch(url, { method, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    } catch (e) {
+      const err = new Error('네트워크 오류: ' + (e.message || e)); err.status = 0; throw err;
+    }
+    const text = await res.text().catch(() => '');
+    if (!res.ok) { const err = new Error('크랙 ' + res.status + (text ? ' (' + text.replace(/\s+/g, ' ').slice(0, 120) + ')' : '')); err.status = res.status; throw err; }
+    if (!text) return {};
+    try { return JSON.parse(text); } catch (e) { return {}; }
   }
 
-  // 대화 기록(시간순). 크랙이 대화 기록 주소를 contents-api에서 crack-api로 옮겨서(예전 주소는 CORS로 막힘)
-  // crack-api에서 먼저 읽고, 안 되면 CrackUtil(예전 주소)로 읽는다
+  // 대화 기록(시간순). 크랙은 새것부터 쪽마다 최대 20개, data.messages와 data.nextCursor로 준다
   const MSG_API = 'https://crack-api.wrtn.ai/crack-gen/v3/chats/';
   const MEM_API = MSG_API;
+  const PROFILE_API = 'https://crack-api.wrtn.ai/crack-api/profiles';
   const msgsOf = (d) => (d && Array.isArray(d.messages) ? d.messages : d && Array.isArray(d.list) ? d.list : Array.isArray(d) ? d : null);
-  async function fetchLogsNew(c, id, maxCount) {
-    const base = MSG_API + id + '/messages?limit=20';
+  async function fetchLogs(id, maxCount) {
+    const n = maxCount > 0 ? maxCount : -1;
+    const base = MSG_API + id + '/messages?limit=' + (n > 0 ? Math.min(20, n) : 20);
     const out = [];
     let cursor = null, pages = 0;
     for (;;) {
       if (pages) await pause(20);
-      const r = await c.network().authFetch('GET', base + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
-      if (r instanceof Error) throw r;
+      const r = await api('GET', base + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
       const arr = msgsOf(r && r.data);
       if (!arr) throw new Error('대화 기록 응답 모양이 예상과 달라요.');
       pages++;
       for (const m of arr) {
         if (!m || !m.content) continue;
         out.push({ id: m._id || m.id, role: m.role, content: m.content, isPrologue: !!m.isPrologue });
-        if (maxCount > 0 && out.length >= maxCount) return out.reverse();
+        if (n > 0 && out.length >= n) return out.reverse();
       }
       const next = r.data && r.data.nextCursor;
       if (!next || !arr.length || pages >= 500) break;
       cursor = next;
     }
     return out.reverse(); // 크랙은 새것부터 준다
-  }
-  let logsApi = 'new'; // 한 번 예전 주소로만 읽혔으면 그 뒤로는 예전 주소부터
-  async function fetchLogs(id, maxCount) {
-    const c = CU();
-    if (!c) throw new Error('크랙 도구(CrackUtil)를 불러오지 못했어요. 페이지를 새로고침해 보세요.');
-    const n = maxCount || -1;
-    const viaOld = async () => {
-      const items = await c.chatRoom().extractLogs(id, { maxCount: n, naturalOrder: true });
-      if (items instanceof Error) throw items;
-      return (items || []).map((m) => ({ id: m.id, role: m.role, content: m.content, isPrologue: !!m.isPrologue }));
-    };
-    const order = logsApi === 'old' ? [viaOld, () => fetchLogsNew(c, id, n)] : [() => fetchLogsNew(c, id, n), viaOld];
-    let first = null;
-    for (let i = 0; i < order.length; i++) {
-      try {
-        const r = await order[i]();
-        if (i) logsApi = logsApi === 'old' ? 'new' : 'old';
-        return r;
-      } catch (e) { if (!first) first = e; }
-    }
-    throw first;
   }
 
   // 크랙에서 읽는 작품 이름(스토리 이름, 캐릭터 채팅이면 캐릭터 이름. 채팅방 제목은 채팅마다 달라 안 씀)과 페르소나 이름.
@@ -1352,32 +1356,36 @@
     const info = { name: '', persona: '' };
     let ok = true;
     try {
-      const c = CU();
-      const r = await c.network().authFetch('GET', MEM_API + id);
-      const d = r && !(r instanceof Error) ? r.data : null;
-      if (d && typeof d === 'object') info.name = String((d.story && d.story.name) || (d.character && d.character.name) || '').trim();
-      else ok = false;
-      const room = c.chatRoom();
-      const p = room.currentPersona ? await room.currentPersona(id) : null;
-      if (p instanceof Error) ok = false;
-      else if (p && p.name) info.persona = String(p.name).trim();
+      const r = await api('GET', MEM_API + id);
+      const d = r && r.data;
+      if (d && typeof d === 'object') {
+        info.name = String((d.story && d.story.name) || (d.character && d.character.name) || '').trim();
+        // 이 채팅방에 고른 페르소나(chatProfileId)를 내 페르소나 목록에서 찾는다
+        if (d.chatProfileId) {
+          const me = await api('GET', PROFILE_API);
+          const uid = me && me.data && me.data._id;
+          const pl = uid ? await api('GET', PROFILE_API + '/' + encodeURIComponent(uid) + '/chat-profiles') : null;
+          const list = pl && pl.data && Array.isArray(pl.data.chatProfiles) ? pl.data.chatProfiles : [];
+          const hitP = list.find((x) => x && x._id === d.chatProfileId);
+          if (hitP && hitP.name) info.persona = String(hitP.name).trim();
+        }
+      } else ok = false;
     } catch (e) { ok = false; }
     if (ok) crackInfo.set(id, { info, at: Date.now() });
     return info;
   }
 
   async function fetchMemory(id) {
-    const c = CU();
-    if (!c) throw new Error('크랙 도구(CrackUtil)를 불러오지 못했어요.');
     const base = MEM_API + id + '/summaries?type=longTerm&orderBy=newest&filter=all&limit=20';
     const list = [], seen = new Set();
     let cursor = null, pages = 0, partial = false;
     for (;;) {
       if (pages) await pause(20);
-      const r = await c.network().authFetch('GET', base + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
-      const arr = r && !(r instanceof Error) && r.data && Array.isArray(r.data.summaries) ? r.data.summaries : null;
+      let r = null, fail = null;
+      try { r = await api('GET', base + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '')); } catch (e) { fail = e; }
+      const arr = r && r.data && Array.isArray(r.data.summaries) ? r.data.summaries : null;
       if (!arr) {
-        if (!pages) throw (r instanceof Error ? r : new Error('장기기억 응답 모양이 예상과 달라요.'));
+        if (!pages) throw (fail || new Error('장기기억 응답 모양이 예상과 달라요.'));
         partial = true; break;
       }
       pages++;
@@ -1397,27 +1405,13 @@
     return { list, partial };
   }
 
-  // 장기기억 고치기·지우기·되살리기. 응답 본문이 비어 있어도 성공으로 본다(authFetch는 빈 본문을 오류로 봄)
+  // 장기기억 고치기·지우기·되살리기. 응답 본문이 비어 있어도 성공으로 본다
   async function crackWrite(method, url, body) {
-    let token = null;
-    try { const c = CU(); token = c && c.cookie ? c.cookie().getAuthToken() : null; } catch (e) { token = null; }
-    if (!token) { const m = document.cookie.match(/(?:^|;\s*)access_token=([^;]+)/); token = m ? decodeURIComponent(m[1]) : null; }
-    if (!token) throw new Error('로그인 정보를 찾지 못했어요. 페이지를 새로고침해 보세요.');
-    let res;
-    try {
-      res = await fetch(url, { method, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-    } catch (e) {
-      const err = new Error('네트워크 오류: ' + (e.message || e)); err.status = 0; throw err;
-    }
-    const text = await res.text().catch(() => '');
-    if (!res.ok) { const err = new Error('크랙 ' + res.status + (text ? ' (' + text.replace(/\s+/g, ' ').slice(0, 120) + ')' : '')); err.status = res.status; throw err; }
-    if (!text) return { result: 'SUCCESS' };
-    let j = null;
-    try { j = JSON.parse(text); } catch (e) { return { result: 'SUCCESS' }; }
+    const j = await api(method, url, body);
     if (j && (j.success === false || /^(?:FAIL|FAILED|FAILURE|ERROR)$/i.test(String(j.result || '')))) {
       const err = new Error('크랙이 변경을 받지 않았어요'); err.status = 422; throw err;
     }
-    return j;
+    return j && Object.keys(j).length ? j : { result: 'SUCCESS' };
   }
   const patchMemory = (id, sid, title, summary) => crackWrite('PATCH', MEM_API + id + '/summaries/' + encodeURIComponent(sid), { title, summary });
   const deleteMemory = (id, sid) => crackWrite('DELETE', MEM_API + id + '/summaries/' + encodeURIComponent(sid));
@@ -1441,16 +1435,10 @@
     } catch (e) { /* 창이 없거나 모양이 달라도 괜찮음 */ }
   }
 
-  // 응답 고치기도 crack-api에서 먼저, 안 되면 CrackUtil(예전 주소)로
+  // 응답 고치기
   async function editMessage(id, messageId, content) {
-    try {
-      await crackWrite('PATCH', MSG_API + id + '/messages/' + encodeURIComponent(messageId), { message: content });
-      return true;
-    } catch (e) {
-      const r = await CU().chatRoom().editMessage(id, messageId, content);
-      if (r instanceof Error) throw e;
-      return true;
-    }
+    await crackWrite('PATCH', MSG_API + id + '/messages/' + encodeURIComponent(messageId), { message: content });
+    return true;
   }
 
   const P = {
