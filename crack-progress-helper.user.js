@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 경과 정리기
 // @namespace    crack-progress-helper
-// @version      1.9.2
+// @version      1.10.0
 // @description  크랙 롤플레이의 턴 수를 세다가 경과를 정리할 때가 되면 알려 주고, 대화 기록을 AI에게 맡길 정리 요청 파일로 만들어 줍니다. AI 답을 붙여 넣으면 경과를 크랙 자동 장기기억 칸에 바로 넣고(되돌리기 가능), 상태창이 작품 원래 모양에서 벗어나면 알려 줍니다. 작품마다 설정을 따로 기억해 어느 작품에서나 씁니다.
 // @match        https://crack.wrtn.ai/*
 // @homepageURL  https://github.com/LikeGale/crack-chat-helper
@@ -532,7 +532,21 @@
     return cleanWork(w);
   };
 
-  const isGyeong = (s) => /^경과/.test(String((s && s.title) || '').trim());
+  // 경과 칸 알아보기. 1.10.0부터 제목은 내용(날짜·장소·인물·사건, 20자까지)이고 본문 끝 줄에 '〔경과N · 턴a~b〕' 표시가 붙는다
+  // (장기기억은 대화에 나온 낱말로 찾아오니 제목을 '경과N · 턴a~b'로 쓰면 못 찾는다). 예전 칸은 제목이 '경과N · 턴a~b'
+  const TAG_RE = /(?:^|\n)[ \t]*〔\s*경과\s*(\d+)\s*(?:·\s*턴\s*(\d+)\s*[~\-–]\s*(\d+)\s*)?〕[ \t]*$/;
+  const tagOf = (s) => {
+    const m = String((s && s.summary) || '').replace(/\s+$/, '').match(TAG_RE);
+    if (m) return { n: +m[1], from: m[2] ? +m[2] : null, to: m[3] ? +m[3] : null };
+    const t = String((s && s.title) || '').trim(), n = t.match(/^경과\s*(\d+)/);
+    if (!n) return null;
+    const r = Core.gyeongRange(t);
+    return { n: +n[1], from: r ? r.from : null, to: r ? r.to : null };
+  };
+  Core.tagOf = tagOf;
+  Core.gyeongTag = (n, from, to) => '〔경과' + n + ' · 턴' + from + '~' + to + '〕';
+  Core.stripTag = (summary) => String(summary || '').replace(/\s+$/, '').replace(TAG_RE, '').replace(/\s+$/, '');
+  const isGyeong = (s) => !!tagOf(s);
   const memVal = (s, f) => (s && s[f] !== undefined && s[f] !== null ? String(s[f]) : '');
   const timeOf = (s) => { const t = Date.parse(s && s.createdAt); return Number.isFinite(t) ? t : null; };
   const fmtMem = (s) => '[' + String(s.title || '').trim() + ']\n' + String(s.summary || '').trim();
@@ -545,7 +559,7 @@
 
   Core.formatExisting = (summaries) => (summaries || [])
     .filter(isGyeong)
-    .sort((x, y) => (parseInt(String(x.title).replace(/\D/g, ''), 10) || 0) - (parseInt(String(y.title).replace(/\D/g, ''), 10) || 0))
+    .sort((x, y) => tagOf(x).n - tagOf(y).n)
     .map(fmtMem)
     .join('\n\n');
 
@@ -588,7 +602,7 @@
     return m ? { from: null, to: +m[1] } : null;
   };
   Core.lastFromMemory = (list) => (list || []).reduce((mx, s) => {
-    const r = Core.gyeongRange(s && s.title);
+    const r = tagOf(s);
     return r && r.to > mx ? r.to : mx;
   }, 0);
 
@@ -628,7 +642,7 @@
       const users = oldestFirst(list.filter(isUser));
       const autos = oldestFirst(list.filter((s) => !isUser(s)));
       if (autos.length) {
-        const existing = autos.map((s, i) => '[칸' + (i + 1) + ' · ' + (isGyeong(s) ? String(s.title).trim() : P.name + ' 요약 · 지금 제목: ' + String(s.title || '').trim()) + ']\n' + String(s.summary || '').trim()).join('\n\n');
+        const existing = autos.map((s, i) => '[칸' + (i + 1) + ' · ' + (isGyeong(s) ? '경과 · 지금 제목: ' : P.name + ' 요약 · 지금 제목: ') + String(s.title || '').trim() + ']\n' + String(s.summary || '').trim()).join('\n\n');
         return { mode: 'slots', existing, others: users.map(fmtMem).join('\n\n'), autoCount: autos.length, userCount: users.length, gyeongCount: autos.filter(isGyeong).length, total: list.length, mark };
       }
     }
@@ -684,7 +698,7 @@
       '3. 빼는 것:감정과 분위기 묘사(충격,경악,당황,눈물,감동 등),농담,같은 내용 반복,OOC 지시',
       '4. ' + who + ' 입력의 대사와 행동은 그대로 사실로 다룬다. AI 응답이 ' + who + '의 속마음을 짐작해 쓴 부분은 사실로 쓰지 않는다.' + (noMarkWord ? ' ' + noMarkWord + '은 요약이나 OOC 답변일 수 있으니 본문 기록과 어긋나면 본문을 따른다.' : ''),
       '5. 기존 경과의 오래된 내용은 지금도 영향이 있는 것만 남기고 줄인다. 새 대화 기록은 시간순으로 이어 붙인다.',
-      '6. 형식:항목마다 첫 줄은 짧은 제목(날짜,장소,사건). 다음 줄부터 \'-\'로 시작하는 개조식. 문장 부호(, . :) 앞뒤에 공백을 넣지 않는다.',
+      '6. 형식:항목마다 첫 줄은 장기기억 제목이 된다. 첫 줄은 ' + TITLE_MAX + '자 이내로, 나중에 대화에 다시 나올 낱말(날짜,장소,인물,사건)로 쓴다. \'경과\'나 턴 번호는 첫 줄에 쓰지 않고, 다른 칸 제목과 겹치지 않게 한다. 다음 줄부터 \'-\'로 시작하는 개조식. 문장 부호(, . :) 앞뒤에 공백을 넣지 않는다.',
       cap
         ? '7. 경과는 ' + P.name + ' 자동 장기기억 칸에 하나씩 넣는다. 자동 칸은 ' + N + '개지만 경과는 ' + cap + '개까지만 둔다. 경과1부터 경과' + cap + '까지 칸1부터 칸' + cap + '까지(오래된 칸부터) 하나씩 넣고, 나머지 칸(칸' + (cap + 1) + (cap + 1 < N ? '~칸' + N : '') + ')은 지운다. 자리가 모자라면 오래된 경과끼리 합쳐 줄이되 지금도 영향이 있는 사실은 남긴다. 항목 하나는 줄바꿈 포함 ' + s.maxChars + '자 이내.'
         : slots
@@ -702,10 +716,10 @@
       for (const l of lines) if (l.trim()) seenRule.add(l.trim());
       if (r) rules.push(r);
     }
-    const labelRule = '라벨은 \'경과N · 턴a~b\' 꼴로 그 항목이 담은 턴 범위를 붙인다(20자 이하. 정리기가 이 숫자로 마지막 정리 턴을 읽어 다른 기기와 맞춘다). 본문은 그대로인데 제목에 턴 범위가 없거나 틀린 항목은 \'라벨 · 제목만 수정\'으로 쓴다.';
+    const labelRule = '라벨은 \'경과N · 턴a~b\' 꼴로 그 항목이 담은 턴 범위를 붙인다. 라벨은 장기기억 제목이 아니다. 정리기가 본문 끝에 \'〔경과N · 턴a~b〕\'로 붙여 칸과 마지막 정리 턴을 맞춘다. 본문은 그대로인데 끝 표시가 없거나 틀린 항목은 \'라벨 · 제목만 수정\'으로 쓴다.';
     const pasteBack = ' 사용자는 이 답을 통째로 정리기에 붙여 넣어 장기기억에 바로 넣으니, 이 줄 모양을 바꾸지 않는다.';
     const answer1 = slots
-      ? '1. 경과1부터 경과' + K + '까지 칸 순서대로 모두 보여 준다. ' + labelRule + ' 수정·새로 항목은 \'라벨 · 글자 수 · 수정(또는 새로) · 넣을 칸의 지금 제목\' 한 줄 뒤에 본문을 코드 블록 하나로 준다. 넣을 칸의 지금 제목은 아래 [칸N · …]의 제목(' + P.name + ' 요약이면 \'지금 제목:\' 뒤)을 글자 그대로 옮긴다. 그대로 항목은 \'라벨 · 그대로\' 한 줄만 쓴다.' + (cap ? ' 지울 칸은 \'칸N · 지움 · 지금 제목\' 한 줄씩 쓴다.' : '') + pasteBack
+      ? '1. 경과1부터 경과' + K + '까지 칸 순서대로 모두 보여 준다. ' + labelRule + ' 수정·새로 항목은 \'라벨 · 글자 수 · 수정(또는 새로) · 넣을 칸의 지금 제목\' 한 줄 뒤에 본문을 코드 블록 하나로 준다. 넣을 칸의 지금 제목은 아래 [칸N · …]의 \'지금 제목:\' 뒤를 글자 그대로 옮긴다. 그대로 항목은 \'라벨 · 그대로\' 한 줄만 쓴다.' + (cap ? ' 지울 칸은 \'칸N · 지움 · 지금 제목\' 한 줄씩 쓴다.' : '') + pasteBack
       : '1. 경과 항목을 라벨 번호 순서로 모두 보여 준다. ' + labelRule + ' 수정·새로 항목은 \'라벨 · 글자 수 · 수정(또는 새로)\' 한 줄 뒤에 본문을 코드 블록 하나로 준다. 그대로·지움 항목은 \'라벨 · 그대로(또는 지움)\' 한 줄만 쓴다.' + pasteBack;
     const existing = o.existing && o.existing.trim() ? o.existing.trim() : '';
     return [
@@ -718,8 +732,8 @@
       ...(w.name ? ['- 작품: ' + w.name] : []),
       '- 페르소나: ' + who,
       '- 정리 범위: 턴 ' + o.from + '~' + o.to + ' (지금 턴 ' + o.latest + (w.turnMode === 'count' ? ', 턴 번호는 응답 순서로 셈' : '') + ')',
-      '- 마지막으로 정리한 턴: ' + o.lastDone + (o.crackLast ? ' (장기기억 경과 제목 기준 ' + o.crackLast + ')' : ' (경과 제목에 턴 범위 없음)'),
-      slots ? '- 장기기억: 직접 추가 ' + mem.userCount + '개 · ' + P.name + ' 자동 칸 ' + N + '개' + (cap ? ' (경과는 ' + cap + '개까지, 남는 칸은 지움)' : '') : '- 장기기억: 제목이 \'경과\'로 시작하는 칸을 경과로 봄',
+      '- 마지막으로 정리한 턴: ' + o.lastDone + (o.crackLast ? ' (장기기억 경과 표시 기준 ' + o.crackLast + ')' : ' (경과 칸에 턴 범위 없음)'),
+      slots ? '- 장기기억: 직접 추가 ' + mem.userCount + '개 · ' + P.name + ' 자동 칸 ' + N + '개' + (cap ? ' (경과는 ' + cap + '개까지, 남는 칸은 지움)' : '') : '- 장기기억: 끝에 경과 표시가 있거나 제목이 \'경과\'로 시작하는 칸을 경과로 봄',
       '- 만든 때: ' + o.made,
       '',
       '## 답하는 방식',
@@ -752,6 +766,7 @@
   // ---------------------------------------------------------------------------
   // 크랙 장기기억 한 칸의 한도(크랙 화면 기준): 제목 20자, 내용 300자. 글자 수는 JS 길이(이모지 2자)
   const TITLE_MAX = 20, BODY_MAX = 300;
+  const cutTitle = (t) => { const a = Array.from(String(t || '').trim()); let out = ''; for (const ch of a) { if ((out + ch).length > TITLE_MAX) break; out += ch; } return out.trim(); };
   const SEP = '·ㆍ•‧∙|—・/'; // 머리줄 칸 사이 구분 기호
   const OPEN = '(\\[（【', CLOSE = ')\\]）】';
   const DECO = '[*_`]*'; // 굵게·기울임·코드 표시
@@ -802,6 +817,7 @@
       t = t.replace(/^(?:넣을\s*칸[^:：]*|지금\s*제목[^:：]*)[:：]\s*/, '')
         .replace(/^칸\s*\d+\s*(?:[·ㆍ•|:：\-–]\s*)?/, '')
         .replace(new RegExp('^' + escU(P.name) + '\\s*요약\\s*[·ㆍ•|:：\\-–]\\s*'), '')
+        .replace(/^경과\s*[·ㆍ•|:：\-–]\s*/, '')
         .replace(/^[(（\[【]\s*(.*?)\s*[)）\]】]$/, '$1')
         .trim();
     } while (t !== prev);
@@ -986,7 +1002,9 @@
     const pool = slotsMode ? autos : oldestFirst(all.filter(isGyeong));
     const goneSet = new Set((o.gone || []).map(normTitle));
     const byTitle = (t) => pool.filter((s) => normTitle(s.title) === normTitle(t));
-    const gNo = (s) => { const m = String((s && s.title) || '').trim().match(/^경과\s*(\d+)/); return m ? +m[1] : null; };
+    const gNo = (s) => { const g = tagOf(s); return g ? g.n : null; };
+    const sameTag = (g, it) => !!g && g.n === it.n && g.from === it.from && g.to === it.to;
+    const byLabel = (it) => pool.filter((s) => sameTag(tagOf(s), it)); // 이미 넣은 칸(같은 답을 다시 붙여 넣은 경우)
     const goneNo = new Set([...goneSet].map((t) => gNo({ title: t })).filter((n) => n !== null));
     const byNo = (n) => pool.filter((s) => gNo(s) === n);
     const slotNo = (s) => pool.indexOf(s) + 1;
@@ -1022,7 +1040,7 @@
       if (dupN.has(it.n)) { fail(row, '같은 번호가 두 번 나와요'); continue; }
       if (action === '그대로') {
         // 그대로 둘 칸도 찾아 두면, 지울 칸 줄이 그 칸을 잘못 가리킬 때 막을 수 있다
-        const c = it.from !== null && byTitle(label).length === 1 ? byTitle(label) : byNo(it.n);
+        const c = it.from !== null && byLabel(it).length === 1 ? byLabel(it) : byNo(it.n);
         if (c.length === 1 && !claim(row, c[0])) continue;
         row.kind = 'keep';
         continue;
@@ -1040,16 +1058,20 @@
       }
       if (!action) { fail(row, '수정·새로·그대로 같은 표시를 못 읽었어요(머리줄을 \'라벨 · 글자 수 · 수정 · 넣을 칸 제목\' 꼴로 고쳐 주세요)'); continue; }
       if (it.from === null) { fail(row, '라벨에 턴 범위(턴a~b)가 없어요'); continue; }
-      if (label.length > TITLE_MAX) { fail(row, '라벨이 ' + label.length + '자예요(제목은 ' + TITLE_MAX + '자까지)'); continue; }
       let target = null;
       if (action === '제목만') {
         let c = it.slot ? byTitle(it.slot) : [];
         if (c.length > 1 && slotsMode && c.includes(pool[it.n - 1])) c = [pool[it.n - 1]]; // 제목이 겹치면 칸N(위와 같음)
-        if (!c.length) c = byTitle(label);
+        if (!c.length) c = byLabel(it);
         if (!c.length) c = byNo(it.n);
-        if (c.length !== 1) { fail(row, c.length ? '제목이 같은 경과 칸이 여럿이에요' : '제목을 바꿀 칸을 못 찾았어요'); continue; }
+        if (c.length !== 1) { fail(row, c.length ? '번호가 같은 경과 칸이 여럿이에요' : '표시를 고칠 칸을 못 찾았어요'); continue; }
         target = c[0];
-        row.summary = String(target.summary || '');
+        // 본문은 그대로 두고 끝 표시만 고친다. 예전 꼴('경과N · 턴a~b') 제목이면 본문 첫 줄을 제목으로
+        const rest = Core.stripTag(target.summary);
+        const oldTitle = /^경과\s*\d+/.test(String(target.title || '').trim());
+        row.title = oldTitle ? (cutTitle(rest.split('\n')[0].replace(/^[-#*\s]+/, '')) || label) : String(target.title || '');
+        row.summary = (rest ? rest + '\n' : '') + Core.gyeongTag(it.n, it.from, it.to);
+        if (row.summary.length > BODY_MAX) { fail(row, '끝 표시를 붙이면 본문이 ' + row.summary.length + '자예요(' + BODY_MAX + '자까지)'); continue; }
       } else {
         const body = it.body ? normBody(it.body) : '';
         if (!body) { fail(row, '본문을 못 찾았어요'); continue; }
@@ -1062,9 +1084,17 @@
           row.big = Math.abs(body.length - it.chars) > Math.max(10, Math.round(it.chars * 0.05)); // 크게 다르면 넣기 전에 한 번 더 확인
         }
         if (body.length > o.maxChars) addWarn(row, '설정한 ' + o.maxChars + '자보다 길어요');
-        row.summary = body;
+        // 첫 줄은 장기기억 제목, 나머지 + 끝 표시는 본문. 첫 줄이 제목 꼴이 아니면(개조식, 너무 김) 본문은 통째로 두고 제목만 앞부분으로
         const ls = body.split('\n');
-        row.head = ls[0]; row.tail = ls.length > 1 ? ls[ls.length - 1] : '';
+        const first = ls[0].replace(/^[#*\s]+|[*\s]+$/g, '');
+        const isHead = first && !/^-/.test(first) && first.length <= TITLE_MAX;
+        if (!isHead) addWarn(row, '첫 줄이 ' + (/^-/.test(first) ? '개조식이라' : first.length + '자라') + ' 제목에는 앞 ' + TITLE_MAX + '자만 넣어요');
+        row.title = isHead ? first : cutTitle(first.replace(/^-\s*/, '')) || label;
+        const rest = isHead ? ls.slice(1).join('\n').trim() : body;
+        row.summary = (rest ? rest + '\n' : '') + Core.gyeongTag(it.n, it.from, it.to);
+        if (row.summary.length > BODY_MAX) { fail(row, '끝 표시까지 본문이 ' + row.summary.length + '자예요(' + BODY_MAX + '자까지)'); continue; }
+        const rl = rest ? rest.split('\n') : [];
+        row.head = rl[0] || ''; row.tail = rl.length > 1 ? rl[rl.length - 1] : '';
         if (it.slot) {
           const c = byTitle(it.slot);
           if (c.length > 1) {
@@ -1074,12 +1104,12 @@
             target = at;
           } else if (c.length === 1) target = c[0];
           else {
-            const done = byTitle(label);
+            const done = byLabel(it);
             if (done.length === 1) target = done[0]; // 이미 넣은 칸(다시 붙여 넣은 경우)
             else { fail(row, '넣을 칸을 못 찾았어요: \'' + it.slot + '\''); continue; }
           }
         } else {
-          const done = byTitle(label);
+          const done = byLabel(it);
           const viaParen = it.paren ? byTitle(it.paren) : [];
           const sameNo = byNo(it.n);
           if (done.length === 1) target = done[0];
@@ -1097,8 +1127,8 @@
         }
       }
       // 더 최근 경과를 예전 범위로 덮어쓰지 않게(예전 답, 잘못 고른 칸)
-      const cur = Core.gyeongRange(target.title);
-      if (cur && cur.to > it.to && normTitle(target.title) !== normTitle(label)) { fail(row, '더 최근 경과(' + String(target.title).trim() + ')를 예전 범위로 덮어써요'); continue; }
+      const cur = tagOf(target);
+      if (cur && cur.to !== null && cur.to > it.to && !sameTag(cur, it)) { fail(row, '더 최근 경과(경과' + cur.n + ' · 턴' + (cur.from !== null ? cur.from + '~' : '~') + cur.to + ')를 예전 범위로 덮어써요'); continue; }
       if (!claim(row, target)) continue;
       row.kind = normTitle(target.title) === normTitle(row.title) && normBody(target.summary) === normBody(row.summary) ? 'same' : 'patch';
     }
@@ -1391,10 +1421,11 @@
   const addMemory = (id, title, summary) => crackWrite('POST', MEM_API + id + '/summaries', { type: 'longTerm', title, summary });
 
   // 크랙의 장기기억 창이 '장기 기억' 탭으로 열려 있으면 다른 탭을 눌렀다 돌아와 목록을 새로 받게 한다
+  const crackMemoryDialog = () => [...document.querySelectorAll('[role="dialog"]')].find((d) => !d.closest('#cph-wrap') && [...d.querySelectorAll('button')].some((b) => b.textContent.trim() === '장기 기억'));
   function refreshCrackMemoryDialog() {
     try {
       const TABS = ['장기 기억', '단기 기억', '관계도', '목표'];
-      const dlg = [...document.querySelectorAll('[role="dialog"]')].find((d) => !d.closest('#cph-wrap') && [...d.querySelectorAll('button')].some((b) => b.textContent.trim() === '장기 기억'));
+      const dlg = crackMemoryDialog();
       if (!dlg) return;
       const tabs = [...dlg.querySelectorAll('button')].filter((b) => TABS.includes(b.textContent.trim()));
       const longTab = tabs.find((b) => b.textContent.trim() === '장기 기억');
@@ -1430,6 +1461,7 @@
     fetchMemory, // (채팅방) → { list: 장기기억 칸들(새것부터), partial }
     patchMemory, deleteMemory, addMemory, // 장기기억 고치기·지우기·되살리기(실패하면 status가 붙은 Error)
     refreshMemoryView: refreshCrackMemoryDialog, // 플랫폼 화면의 장기기억 창을 새로 받게(못 하면 아무것도 안 함)
+    memoryViewOpen: () => { try { return !!crackMemoryDialog(); } catch (e) { return false; } }, // 플랫폼 화면의 장기기억 창이 열려 있는지
     editMessage, // (채팅방, 응답 id, 새 내용) → 응답 고치기
   };
 
@@ -1472,6 +1504,8 @@
   @media (min-width:1600px) and (pointer:fine){#cph-badge{font-size:15px;padding:10px 16px;min-height:40px}}
   #cph-wrap{position:fixed;inset:0;z-index:2147483001;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:24px 12px}
   /* PC: 바탕을 깔지 않아 채팅을 그대로 쓸 수 있고, 패널은 머리줄을 끌어 옮긴다 */
+  #cph-guard{position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.35);cursor:wait;touch-action:none}
+  #cph-guard div{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);max-width:calc(100vw - 32px);box-sizing:border-box;padding:10px 14px;border-radius:8px;background:#3a2f12;color:#ffd98a;border:1px solid #7a6020;font:600 14px/1.4 system-ui,sans-serif;text-align:center}
   #cph-wrap.pc{background:transparent;pointer-events:none;display:block;overflow:visible;padding:0}
   #cph-wrap.pc #cph-panel{position:fixed;pointer-events:auto;width:600px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;box-sizing:border-box}
   #cph-wrap.pc #cph-panel > header{cursor:move;user-select:none;touch-action:none}
@@ -1676,7 +1710,7 @@
     }
   }
 
-  // 장기기억 경과 제목에서 마지막 정리 턴을 읽는다(다른 기기에서 정리한 것도 반영). 2분에 한 번까지
+  // 장기기억 경과 표시(본문 끝 〔경과N · 턴a~b〕, 예전 칸은 제목)에서 마지막 정리 턴을 읽는다(다른 기기에서 정리한 것도 반영). 2분에 한 번까지
   const memSync = { chat: null, at: 0, busy: false };
   async function syncMemory(force) {
     const id = P.chatId();
@@ -1988,11 +2022,20 @@
     if (!panelHist || ourState()) return;
     panelHist = false;
     if (location.href !== panelHref) return; // 뒤로가기가 아니라 주소가 바뀐 것(# 바꾸기 등): 패널은 그대로
+    if (memWriteBusy) { e.stopImmediatePropagation(); pushPanelHistory(); return; } // 장기기억에 넣는 동안은 닫지 않는다
     const w = document.getElementById('cph-wrap');
     if (w) { e.stopImmediatePropagation(); w.remove(); }
   }, true);
   // 사용자가 닫을 때(닫기, 바깥 누르기, Esc). 휴대폰에서 넣어 둔 기록이 맨 위에 있으면 함께 뺀다
+  // 장기기억에 넣거나 되돌리는 동안 플랫폼 화면을 덮는다(그사이 장기기억 창을 열면 몇 칸이 안 들어갈 수 있어서)
+  function guard(on, what) {
+    let g = document.getElementById('cph-guard');
+    if (!on) { if (g) g.remove(); return; }
+    if (!g) { g = el('div', { id: 'cph-guard', role: 'alert' }, el('div')); document.body.appendChild(g); }
+    g.firstChild.textContent = '장기기억에 ' + what + ' 중이에요. 끝날 때까지 ' + P.name + ' 화면(장기기억 창 포함)을 건드리지 말아 주세요.';
+  }
   function closePanel(wrap) {
+    if (memWriteBusy) return; // 장기기억에 넣는 동안은 닫지 않는다(끝나면 닫을 수 있음)
     wrap.remove();
     if (panelHist && ourState()) { panelHist = false; popOurs = true; history.back(); }
     else panelHist = false;
@@ -2094,7 +2137,7 @@
     // 1. 진행 현황
     const lastInput = el('input', { type: 'number', min: '0', value: String(getLastTurn(id)) });
     const sinceLine = el('div', { class: 'muted' });
-    const syncLine = el('div', { class: 'muted', text: '장기기억의 경과 제목을 확인하는 중…' });
+    const syncLine = el('div', { class: 'muted', text: '장기기억의 경과 표시를 확인하는 중…' });
     let fromTouched = false, toTouched = false;
     fromInput.addEventListener('input', () => { fromTouched = true; });
     toInput.addEventListener('input', () => { toTouched = true; });
@@ -2109,13 +2152,13 @@
       const crack = getCrackLast(id), local = getLocalLast(id);
       if (crack && local > crack) {
         syncLine.className = 'bad';
-        syncLine.textContent = '이 기기에서는 턴 ' + local + '까지 정리 완료로 눌렀는데, 장기기억 경과 제목은 턴 ' + crack + '까지예요. 새 경과 칸 제목에 턴 범위를 넣어야 다른 기기에서도 이어져요.';
+        syncLine.textContent = '이 기기에서는 턴 ' + local + '까지 정리 완료로 눌렀는데, 장기기억 경과 표시는 턴 ' + crack + '까지예요. 경과를 장기기억에 넣어야 다른 기기에서도 이어져요.';
       } else if (crack) {
         syncLine.className = 'muted';
-        syncLine.textContent = '장기기억 경과 제목에서 턴 ' + crack + '까지 정리한 걸로 읽었어요. 다른 기기도 이 값을 써요.';
+        syncLine.textContent = '장기기억 경과 표시에서 턴 ' + crack + '까지 정리한 걸로 읽었어요. 다른 기기도 이 값을 써요.';
       } else {
         syncLine.className = 'muted';
-        syncLine.textContent = '경과 칸 제목에 턴 범위가 없어서 이 기기에 저장한 값만 써요. 제목을 \'경과1 · 턴1~12\'처럼 바꾸면 다른 기기에서도 이어져요.';
+        syncLine.textContent = '경과 칸에 턴 범위가 없어서 이 기기에 저장한 값만 써요. 정리기로 경과를 넣으면 본문 끝에 \'〔경과1 · 턴1~12〕\' 표시가 붙어 다른 기기에서도 이어져요.';
       }
     };
     // 장기기억을 읽은 뒤 마지막 정리 턴이 바뀌었으면 화면을 맞춘다
@@ -2314,12 +2357,12 @@
       if (mem.mode === 'slots') {
         memLabel.textContent = P.name + ' 자동 장기기억 칸 ' + mem.autoCount + '개, 오래된 칸부터(고쳐도 돼요)';
         existingTa.placeholder = '';
-        notes.push('장기기억 ' + mem.total + '개: 직접 추가 ' + mem.userCount + '개(참고로만 넣음), 자동 칸 ' + mem.autoCount + '개(경과 자리, 그중 제목이 경과인 칸 ' + mem.gyeongCount + '개).');
+        notes.push('장기기억 ' + mem.total + '개: 직접 추가 ' + mem.userCount + '개(참고로만 넣음), 자동 칸 ' + mem.autoCount + '개(경과 자리, 그중 경과가 든 칸 ' + mem.gyeongCount + '개).');
         notes.push('구분 기준: ' + (mark.value === null ? mark.field + ' 값으로 보면 전부 자동 칸' : mark.field + ' = ' + mark.value + ' → 직접 추가') + (mark.how === '설정' ? '(설정에서 넣은 값)' : '') + '.');
       } else {
         memLabel.textContent = '지금 장기기억에 있는 경과(고쳐도 돼요)';
         existingTa.placeholder = '경과 항목이 없어요. 처음이면 비워 두세요.';
-        notes.push(mem.count ? '장기기억 ' + mem.total + '개 중 제목이 \'경과\'로 시작하는 칸 ' + mem.count + '개를 경과로 봤어요.' : '장기기억 ' + mem.total + '개 중 경과로 볼 칸이 없어요.');
+        notes.push(mem.count ? '장기기억 ' + mem.total + '개 중 경과 칸 ' + mem.count + '개를 경과로 봤어요.' : '장기기억 ' + mem.total + '개 중 경과로 볼 칸이 없어요.');
         if (mark) notes.push('자동 칸이 없어서 제목으로 골랐어요.');
         else if (r.list.length) { bad = true; notes.push('직접 추가한 칸과 자동 칸을 가르지 못했어요(' + Core.describeFields(r.list) + '). 이 문구를 정리기 만든 사람에게 알려 주세요.'); }
         if (!mem.count && last > 0) { bad = true; notes.push('마지막 정리 턴이 ' + last + '인데 경과 항목이 없어요.'); }
@@ -2362,7 +2405,7 @@
     const rowLine = (r) => {
       const slot = r.slot ? '칸' + r.slotNo + ' \'' + String(r.slot.title || '').trim() + '\'' + (Core.isUserCard(r.slot, memMark) || (plan && !plan.slotsMode) ? '(직접 추가 칸일 수 있음)' : '') : '';
       const LOOK = {
-        patch: ['바꿈', 'ok', r.label + ' → ' + slot + (r.action === '제목만' ? ' (제목만)' : ' · ' + r.summary.length + '자')],
+        patch: ['바꿈', 'ok', r.label + ' → ' + slot + ' · 새 제목 \'' + r.title + '\'' + (r.action === '제목만' ? ' (끝 표시만)' : ' · ' + r.summary.length + '자')],
         same: ['같음', 'muted', r.label + ' · 이미 들어 있어요'],
         keep: ['그대로', 'muted', r.label],
         delete: ['지움', 'bad', slot],
@@ -2407,7 +2450,7 @@
       if (plan.gone) parts.push('이미 지운 칸 ' + plan.gone + '개');
       ansSum.textContent = parts.join(' · ') + '. ' + (plan.patch + plan.del
         ? (plan.lastTo ? '넣고 나면 턴 ' + Math.max(plan.lastTo, getLastTurn(id)) + '까지 정리한 걸로 돼요.' : '') +
-          (plan.slotsMode ? '' : ' 자동 칸을 못 찾아서 제목이 경과인 칸을 바꿔요.')
+          (plan.slotsMode ? '' : ' 자동 칸을 못 찾아서 경과 칸을 바꿔요.')
         : '더 넣을 게 없어요.');
       if (plan.stale) {
         ansSum.className = 'bad';
@@ -2438,7 +2481,9 @@
       P.refreshMemoryView();
       return after;
     };
-    const setBusy = (on) => { memWriteBusy = on; ansTa.readOnly = on; if (on) { applyBtn.disabled = true; undoBtn.disabled = true; disarm(); } };
+    const setBusy = (on, what) => { memWriteBusy = on; ansTa.readOnly = on; guard(on, what || '넣는'); if (on) { applyBtn.disabled = true; undoBtn.disabled = true; disarm(); } };
+    // 플랫폼 화면의 장기기억 창이 열려 있으면 먼저 닫게 한다(열어 둔 채 넣으면 몇 칸이 안 들어갈 수 있음)
+    const viewOpen = () => { if (!(P.memoryViewOpen && P.memoryViewOpen())) return false; tell('bad', P.name + '의 장기기억 창이 열려 있어요. 창을 닫고 다시 눌러 주세요(열어 둔 채 넣으면 몇 칸이 안 들어갈 수 있어요).'); return true; };
     const arm = (btn, what, warn) => {
       btn.textContent = what;
       tell('bad', warn);
@@ -2455,7 +2500,7 @@
         const warn = [];
         if (plan.stale) warn.push('예전 답이면 넣지 마세요(이 답은 턴 ' + plan.lastTo + '까지, 장기기억은 턴 ' + plan.stale + '까지).');
         if (plan.mismatch) warn.push('글자 수가 머리줄과 크게 다른 항목이 ' + plan.mismatch + '개 있어요. 위 미리 보기의 첫 줄·끝 줄이 맞는지 보세요.');
-        if (!plan.slotsMode) warn.push('자동 칸이 없어서 제목이 경과인 칸(직접 추가 칸일 수 있음)을 바꿔요.');
+        if (!plan.slotsMode) warn.push('자동 칸이 없어서 경과 칸(직접 추가 칸일 수 있음)을 바꿔요.');
         if (plan.del) warn.push('지운 칸은 되돌리기로 [추가] 카드로만 되살릴 수 있어요.');
         armApply = arm(applyBtn, '한 번 더 누르면 넣어요' + (plan.del ? '(지울 칸 ' + plan.del + '개)' : ''), warn.join(' '));
         tapApply = tap;
@@ -2463,6 +2508,7 @@
       }
       if (twoTaps && tap - tapApply < 700) { tapApply = tap; return; } // 빠르게 여러 번 눌린 건 확인으로 치지 않는다
       const text = planText, seen = plan; // 미리 본 글과 계획으로만 넣는다
+      if (viewOpen()) return;
       setBusy(true);
       let locked = false;
       try {
@@ -2506,9 +2552,9 @@
           const r = todo[i];
           if (i) await pause(80);
           tell('muted', (r.kind === 'delete' ? '지우는 중 ' : '넣는 중 ') + (i + 1) + '/' + todo.length);
+          const put = () => (r.kind === 'delete' ? P.deleteMemory(id, memId(r.slot)) : P.patchMemory(id, memId(r.slot), r.title, r.summary));
           try {
-            if (r.kind === 'delete') await P.deleteMemory(id, memId(r.slot));
-            else await P.patchMemory(id, memId(r.slot), r.title, r.summary);
+            try { await put(); } catch (e) { if (!(e && e.status === 409)) throw e; await pause(800); await put(); } // 409(겹침)는 한 번 더
             done.push(r);
           } catch (e) {
             failed.push({ r, e });
@@ -2569,7 +2615,8 @@
         return;
       }
       if (tap - tapUndo < 700) { tapUndo = tap; return; }
-      setBusy(true);
+      if (viewOpen()) return;
+      setBusy(true, '되돌리는');
       let back = 0, revived = 0, stopped = false, u = null, left = {}, locked = false;
       const save = () => store.set('undo:' + id, Object.keys(left).length ? { at: u.at, last: u.last, key: u.key, items: left } : null);
       try {
@@ -2681,7 +2728,7 @@
         el('div', { class: 'muted', text: '배지는 끌어서 옮길 수 있어요. 키보드로는 배지를 고른 뒤 화살표 키로 옮겨요.' })),
       el('section', null,
         el('h3', { text: '다른 기기로 설정 옮기기' }),
-        el('div', { class: 'muted', text: '마지막 정리 턴은 장기기억 경과 제목으로 기기끼리 저절로 맞춰져요. 위 설정이나 작품 설정을 바꿨을 때만 코드로 옮기면 돼요(저장한 작품 설정도 같이 옮겨요). 배지 자리는 기기마다 따로예요.' }),
+        el('div', { class: 'muted', text: '마지막 정리 턴은 장기기억 경과 표시로 기기끼리 저절로 맞춰져요. 위 설정이나 작품 설정을 바꿨을 때만 코드로 옮기면 돼요(저장한 작품 설정도 같이 옮겨요). 배지 자리는 기기마다 따로예요.' }),
         codeIn,
         el('div', { class: 'row' },
           el('button', { text: '설정 코드 복사', onclick: () => {
