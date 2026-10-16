@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 경과 정리기
 // @namespace    crack-progress-helper
-// @version      1.9.1
+// @version      1.9.2
 // @description  크랙 롤플레이의 턴 수를 세다가 경과를 정리할 때가 되면 알려 주고, 대화 기록을 AI에게 맡길 정리 요청 파일로 만들어 줍니다. AI 답을 붙여 넣으면 경과를 크랙 자동 장기기억 칸에 바로 넣고(되돌리기 가능), 상태창이 작품 원래 모양에서 벗어나면 알려 줍니다. 작품마다 설정을 따로 기억해 어느 작품에서나 씁니다.
 // @match        https://crack.wrtn.ai/*
 // @homepageURL  https://github.com/LikeGale/crack-chat-helper
@@ -1044,6 +1044,7 @@
       let target = null;
       if (action === '제목만') {
         let c = it.slot ? byTitle(it.slot) : [];
+        if (c.length > 1 && slotsMode && c.includes(pool[it.n - 1])) c = [pool[it.n - 1]]; // 제목이 겹치면 칸N(위와 같음)
         if (!c.length) c = byTitle(label);
         if (!c.length) c = byNo(it.n);
         if (c.length !== 1) { fail(row, c.length ? '제목이 같은 경과 칸이 여럿이에요' : '제목을 바꿀 칸을 못 찾았어요'); continue; }
@@ -1066,8 +1067,12 @@
         row.head = ls[0]; row.tail = ls.length > 1 ? ls[ls.length - 1] : '';
         if (it.slot) {
           const c = byTitle(it.slot);
-          if (c.length > 1) { fail(row, '같은 제목 칸이 여럿이라 고를 수 없어요: \'' + it.slot + '\''); continue; }
-          if (c.length === 1) target = c[0];
+          if (c.length > 1) {
+            // 크랙 자동 요약은 제목이 겹치기 쉽다('향후 계획' 등). 경과N은 칸N에 넣는 약속이니 칸N이 그 제목이면 칸N으로
+            const at = slotsMode ? c.find((x) => x === pool[it.n - 1]) : null;
+            if (!at) { fail(row, '같은 제목 칸이 여럿이라 고를 수 없어요: \'' + it.slot + '\''); continue; }
+            target = at;
+          } else if (c.length === 1) target = c[0];
           else {
             const done = byTitle(label);
             if (done.length === 1) target = done[0]; // 이미 넣은 칸(다시 붙여 넣은 경우)
