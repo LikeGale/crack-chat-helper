@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         크랙 경과 정리기
 // @namespace    crack-progress-helper
-// @version      1.11.1
+// @version      1.12.0
 // @description  크랙 롤플레이의 턴 수를 세다가 경과를 정리할 때가 되면 알려 주고, 대화 기록을 AI에게 맡길 정리 요청 파일로 만들어 줍니다. AI 답을 붙여 넣으면 경과를 크랙 자동 장기기억 칸에 바로 넣고(되돌리기 가능), 상태창이 작품 원래 모양에서 벗어나면 알려 줍니다. 작품마다 설정을 따로 기억해 어느 작품에서나 씁니다.
 // @match        https://crack.wrtn.ai/*
+// @match        https://genit.ai/*
+// @match        https://*.genit.ai/*
 // @homepageURL  https://github.com/LikeGale/crack-chat-helper
 // @updateURL    https://raw.githubusercontent.com/LikeGale/crack-chat-helper/main/crack-progress-helper.user.js
 // @downloadURL  https://raw.githubusercontent.com/LikeGale/crack-chat-helper/main/crack-progress-helper.user.js
@@ -1282,6 +1284,7 @@
     return true;
   }
 
+  function crackPlatform() {
   // ---------------------------------------------------------------------------
   // 플랫폼 연결: 크랙(crack.wrtn.ai)
   // 크랙에만 맞춰진 부분은 모두 여기 있다. 다른 플랫폼으로 옮길 때는 이 파일(과 crack.meta.js)만 새로 만들고
@@ -1455,6 +1458,149 @@
     memoryViewOpen: () => { try { return !!crackMemoryDialog(); } catch (e) { return false; } }, // 플랫폼 화면의 장기기억 창이 열려 있는지
     editMessage, // (채팅방, 응답 id, 새 내용) → 응답 고치기
   };
+  return P;
+  }
+
+  function genitPlatform() {
+  // ---------------------------------------------------------------------------
+  // 플랫폼 연결: 젠잇(genit.ai) — 아직 시험 단계
+  // 젠잇의 내부 구조를 아직 모른다. 이번 버전은 정리기가 젠잇에서 켜지고, 설정 탭(또는 대화를 못 읽었다는 안내)의
+  // '진단 복사'로 젠잇 화면 구조와 통신 주소를 모아 보내게 하는 데까지만 한다. 그 결과를 보고 대화 읽기·장기기억을 붙인다.
+  // ---------------------------------------------------------------------------
+  const NOT_YET = '젠잇은 아직 시험 단계라 대화를 읽지 못해요. 진단 복사를 눌러 결과를 보내 주세요.';
+  const notYet = () => { const e = new Error(NOT_YET); e.status = 0; throw e; };
+
+  // 주소 첫 칸의 언어(/ko 등)는 뺀다. 목록·검색 화면이 아니고 채팅으로 보이는 주소면 그 주소를 채팅방 id로 쓴다
+  const LIST_PAGE = /^\/?(?:$|contents|search|login|signup|settings|my|mypage|notice|event)(?:\/|$)/;
+  function genitPath() { return location.pathname.replace(/^\/[a-z]{2}(?:-[A-Z]{2})?(?=\/|$)/, '') || '/'; }
+  function chatId() {
+    const p = genitPath();
+    if (LIST_PAGE.test(p)) return null;
+    const m = p.match(/\/(?:chats?|rooms?|conversations?|c)\/([\w-]+)/);
+    if (m) return m[1];
+    return document.querySelector('textarea,[contenteditable="true"]') ? p : null;
+  }
+  function workIdOf(id) {
+    const m = genitPath().match(/\/(?:characters?|contents?|stories|story|works?|simulations?)\/([\w-]+)/);
+    return (m && m[1]) || id;
+  }
+
+  // 통신 기록: 젠잇이 부르는 주소와 답의 모양(이름만, 값은 안 남김). 스크립트가 켜진 뒤 일어난 요청만 잡힌다
+  const seen = new Map();
+  const maskPath = (u) => { try { const x = new URL(u, location.href); return x.host + x.pathname.replace(/\/(?=[\w-]*\d)[\w-]{8,}(?=\/|$)/g, '/:id'); } catch (e) { return String(u).slice(0, 120); } };
+  function shapeOf(v, depth) {
+    if (Array.isArray(v)) return v.length ? [shapeOf(v[0], depth)] : [];
+    if (v && typeof v === 'object') {
+      if (depth >= 3) return '{…}';
+      const o = {};
+      Object.keys(v).slice(0, 25).forEach((k) => { o[k] = shapeOf(v[k], depth + 1); });
+      return o;
+    }
+    return typeof v;
+  }
+  function note(method, url, status, body) {
+    const key = method + ' ' + maskPath(url);
+    if (seen.size >= 80 && !seen.has(key)) return;
+    let shape = null;
+    if (typeof body === 'string' && /^\s*[[{]/.test(body)) { try { shape = shapeOf(JSON.parse(body), 0); } catch (e) { /* JSON 아님 */ } }
+    seen.set(key, { status, shape });
+  }
+  try {
+    const of = W.fetch;
+    if (typeof of === 'function') {
+      W.fetch = function (input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        const p = of.apply(W, arguments);
+        p.then((res) => {
+          const ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+          if (/json/.test(ct)) res.clone().text().then((t) => note(method, url, res.status, t)).catch(() => {});
+          else note(method, url, res.status, null);
+        }).catch(() => note(method, url, 0, null));
+        return p;
+      };
+    }
+    const XO = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
+    if (XO) {
+      const open = XO.open, send = XO.send;
+      XO.open = function (m, u) { this.__cph = { m: String(m || 'GET').toUpperCase(), u: String(u || '') }; return open.apply(this, arguments); };
+      XO.send = function () {
+        const x = this;
+        x.addEventListener('loadend', () => { try { if (x.__cph) note(x.__cph.m, x.__cph.u, x.status, x.responseType === '' || x.responseType === 'text' ? x.responseText : null); } catch (e) { /* 무시 */ } });
+        return send.apply(this, arguments);
+      };
+    }
+  } catch (e) { /* 못 걸면 주소 목록만 */ }
+
+  const descr = (n) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + (typeof n.className === 'string' && n.className.trim() ? '.' + n.className.trim().split(/\s+/).slice(0, 3).join('.') : '');
+  const snip = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+
+  // 진단: 젠잇 연결을 만드는 데 필요한 것만 모은다. 쿠키·저장소는 이름만, 대화는 30자 조각만
+  function diagnose() {
+    const out = ['[정리기 젠잇 진단] ' + (typeof GM_info !== 'undefined' && GM_info.script ? GM_info.script.version : ''),
+      '주소: ' + location.origin + location.pathname, '제목: ' + document.title,
+      '채팅방 id 추정: ' + chatId() + ' / 작품 id 추정: ' + workIdOf(chatId())];
+    const names = (s) => { try { return Object.keys(s).slice(0, 40).join(', '); } catch (e) { return '(못 읽음)'; } };
+    out.push('쿠키 이름: ' + document.cookie.split(';').map((c) => c.split('=')[0].trim()).filter(Boolean).join(', '));
+    out.push('localStorage 이름: ' + names(W.localStorage), 'sessionStorage 이름: ' + names(W.sessionStorage));
+    out.push('화면 틀: ' + ['__NEXT_DATA__', '__NUXT__', '__remixContext'].filter((k) => W[k] || document.getElementById(k)).join(', '));
+    out.push('', '[입력 칸]');
+    document.querySelectorAll('textarea,[contenteditable="true"],input[type="text"]').forEach((n, i) => {
+      if (i < 8) out.push('- ' + descr(n) + ' placeholder=' + snip(n.getAttribute('placeholder')) + ' 부모=' + (n.parentElement ? descr(n.parentElement) : ''));
+    });
+    // 같은 모양 형제가 많이 이어지는 묶음 = 대화 목록 후보
+    const groups = [];
+    document.querySelectorAll('body *').forEach((n) => {
+      const kids = n.children;
+      if (kids.length < 3 || n.closest('#cph-wrap,#cph-badge')) return;
+      const sig = (k) => k.tagName + '.' + (typeof k.className === 'string' ? k.className : '');
+      const count = {};
+      for (const k of kids) count[sig(k)] = (count[sig(k)] || 0) + 1;
+      const top = Object.keys(count).sort((a, b) => count[b] - count[a])[0];
+      const same = Array.from(kids).filter((k) => sig(k) === top);
+      const textLen = same.reduce((s, k) => s + (k.textContent || '').length, 0);
+      if (same.length >= 3 && textLen > 200) groups.push({ n, same, textLen });
+    });
+    groups.sort((a, b) => b.textLen - a.textLen);
+    out.push('', '[대화 목록 후보]');
+    groups.slice(0, 4).forEach((g) => {
+      out.push('- ' + descr(g.n) + ' 안의 ' + descr(g.same[0]) + ' ×' + g.same.length + ', 글자 ' + g.textLen);
+      g.same.slice(-2).forEach((k) => out.push('    · ' + snip(k.textContent) + ' | 속: ' + Array.from(k.querySelectorAll('*')).slice(0, 4).map(descr).join(' > ')));
+    });
+    out.push('', '[통신] (스크립트가 켜진 뒤 일어난 것. 메시지를 하나 보낸 뒤 진단하면 더 많이 잡혀요)');
+    seen.forEach((v, k) => out.push('- ' + k + ' → ' + v.status + (v.shape ? ' ' + JSON.stringify(v.shape).slice(0, 400) : '')));
+    try {
+      const res = performance.getEntriesByType('resource').filter((r) => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest');
+      const rest = Array.from(new Set(res.map((r) => maskPath(r.name)))).filter((u) => !Array.from(seen.keys()).some((k) => k.endsWith(' ' + u)));
+      rest.slice(0, 40).forEach((u) => out.push('- (켜지기 전) ' + u));
+    } catch (e) { /* 없음 */ }
+    return out.join('\n');
+  }
+
+  const P = {
+    name: '젠잇',
+    appName: '경과 정리기 (젠잇 시험판)',
+    chatId,
+    workId: workIdOf,
+    fetchLogs: async () => notYet(),
+    fetchInfo: async () => ({ name: '', persona: '' }),
+    cachedInfo: () => null,
+    fetchMemory: async () => ({ list: [], partial: false }),
+    patchMemory: async () => notYet(), deleteMemory: async () => notYet(), addMemory: async () => notYet(),
+    refreshMemoryView: () => {},
+    memoryViewOpen: () => false,
+    editMessage: async () => notYet(),
+    diagnose, // 있을 때만: 패널에 '진단 복사' 버튼이 생긴다
+  };
+  return P;
+  }
+
+  // 플랫폼 고르기: 사이트마다 연결 파일 하나만 돌린다(각 파일은 끝에서 const P를 내놓는다)
+  const P = (function () {
+    const host = location.hostname;
+    if (/(^|\.)genit\.ai$/.test(host)) return genitPlatform();
+    return crackPlatform();
+  })();
 
 
   function copy(text) {
@@ -2032,6 +2178,17 @@
     else panelHist = false;
   }
 
+  // 플랫폼이 진단을 내놓으면(시험 단계 플랫폼) 화면 구조·통신 주소를 모아 복사하는 버튼
+  function diagButton() {
+    if (typeof P.diagnose !== 'function') return null;
+    const b = el('button', { text: '진단 복사', onclick: () => {
+      let text;
+      try { text = P.diagnose(); } catch (e) { text = '진단 실패: ' + (e.message || e); }
+      copy(text).then(() => { b.textContent = '복사했어요. 대화창에 붙여 넣어 보내 주세요'; }, () => { b.textContent = '복사하지 못했어요'; });
+    } });
+    return b;
+  }
+
   // carry: 작품 설정을 저장해 다시 그릴 때 옮겨 오는 입력(범위, 장기기억 칸, Claude 답)
   async function openPanel(carry) {
     const id = P.chatId();
@@ -2077,7 +2234,7 @@
     } catch (e) {
       // 다시 그리다 못 읽었으면 옮겨 오던 입력(범위·장기기억 칸·Claude 답)을 그대로 들고 다시 읽을 수 있게
       loading.replaceChildren(el('span', { class: 'bad', text: '대화 기록을 읽지 못했어요: ' + (e.message || e) + ' ' }),
-        el('button', { text: '다시 읽기', onclick: () => openPanel(carryIn) }));
+        el('button', { text: '다시 읽기', onclick: () => openPanel(carryIn) }), diagButton());
       return;
     }
     if (!wrap.isConnected) return; // 읽는 사이 닫았으면 그만
@@ -2715,7 +2872,7 @@
         el('button', { text: '배지 자리 처음으로', onclick: () => {
           store.set('badgePos', null); placeBadge();
           say('ok', '배지를 처음 자리로 옮겼어요.');
-        } }), saveMsg),
+        } }), diagButton(), saveMsg),
         el('div', { class: 'muted', text: '배지는 끌어서 옮길 수 있어요. 키보드로는 배지를 고른 뒤 화살표 키로 옮겨요.' })),
       el('section', null,
         el('h3', { text: '다른 기기로 설정 옮기기' }),
