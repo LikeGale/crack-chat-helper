@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 경과 정리기
 // @namespace    crack-progress-helper
-// @version      1.12.1
+// @version      1.12.2
 // @description  크랙 롤플레이의 턴 수를 세다가 경과를 정리할 때가 되면 알려 주고, 대화 기록을 AI에게 맡길 정리 요청 파일로 만들어 줍니다. AI 답을 붙여 넣으면 경과를 크랙 자동 장기기억 칸에 바로 넣고(되돌리기 가능), 상태창이 작품 원래 모양에서 벗어나면 알려 줍니다. 작품마다 설정을 따로 기억해 어느 작품에서나 씁니다.
 // @match        https://crack.wrtn.ai/*
 // @match        https://genit.ai/*
@@ -1601,12 +1601,23 @@
     }
     return typeof v;
   }
-  function note(method, url, status, body) {
+  const jsonShape = (body) => { if (typeof body === 'string' && /^\s*[[{]/.test(body)) { try { return shapeOf(JSON.parse(body), 0); } catch (e) { /* JSON 아님 */ } } return null; };
+  // 보낸 쪽: 헤더 이름과 본문 모양만(값은 안 남김)
+  function reqOf(headers, body, cred) {
+    const names = [];
+    try {
+      if (headers && typeof headers.forEach === 'function' && !Array.isArray(headers)) headers.forEach((v, k) => names.push(k));
+      else if (Array.isArray(headers)) headers.forEach((h) => names.push(h[0]));
+      else if (headers) Object.keys(headers).forEach((k) => names.push(k));
+    } catch (e) { /* 무시 */ }
+    let b = null;
+    if (body != null) b = jsonShape(body) || (typeof FormData !== 'undefined' && body instanceof FormData ? { FormData: Array.from(body.keys()) } : typeof body);
+    return { h: names.map((n) => String(n).toLowerCase()), b, cred: cred || '' };
+  }
+  function note(method, url, status, body, req) {
     const key = method + ' ' + maskPath(url);
     if (seen.size >= 80 && !seen.has(key)) return;
-    let shape = null;
-    if (typeof body === 'string' && /^\s*[[{]/.test(body)) { try { shape = shapeOf(JSON.parse(body), 0); } catch (e) { /* JSON 아님 */ } }
-    seen.set(key, { status, shape });
+    seen.set(key, { status, shape: jsonShape(body), req: req || (seen.get(key) || {}).req });
   }
   try {
     const of = W.fetch;
@@ -1614,22 +1625,27 @@
       W.fetch = function (input, init) {
         const url = typeof input === 'string' ? input : (input && input.url) || '';
         const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        let req = null;
+        if (method !== 'GET') { try { req = reqOf((init && init.headers) || (input && input.headers), init && init.body, (init && init.credentials) || (input && input.credentials)); } catch (e) { /* 무시 */ } }
         const p = of.apply(W, arguments);
         p.then((res) => {
           const ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
-          if (/json/.test(ct)) res.clone().text().then((t) => note(method, url, res.status, t)).catch(() => {});
-          else note(method, url, res.status, null);
-        }).catch(() => note(method, url, 0, null));
+          if (/json/.test(ct)) res.clone().text().then((t) => note(method, url, res.status, t, req)).catch(() => {});
+          else note(method, url, res.status, null, req);
+        }).catch(() => note(method, url, 0, null, req));
         return p;
       };
     }
     const XO = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
     if (XO) {
-      const open = XO.open, send = XO.send;
-      XO.open = function (m, u) { this.__cph = { m: String(m || 'GET').toUpperCase(), u: String(u || '') }; return open.apply(this, arguments); };
-      XO.send = function () {
+      const open = XO.open, send = XO.send, setH = XO.setRequestHeader;
+      XO.open = function (m, u) { this.__cph = { m: String(m || 'GET').toUpperCase(), u: String(u || ''), h: [] }; return open.apply(this, arguments); };
+      XO.setRequestHeader = function (k) { if (this.__cph) this.__cph.h.push(k); return setH.apply(this, arguments); };
+      XO.send = function (body) {
         const x = this;
-        x.addEventListener('loadend', () => { try { if (x.__cph) note(x.__cph.m, x.__cph.u, x.status, x.responseType === '' || x.responseType === 'text' ? x.responseText : null); } catch (e) { /* 무시 */ } });
+        let req = null;
+        if (x.__cph && x.__cph.m !== 'GET') { try { req = reqOf(x.__cph.h.map((k) => [k]), body, x.withCredentials ? 'include' : ''); } catch (e) { /* 무시 */ } }
+        x.addEventListener('loadend', () => { try { if (x.__cph) note(x.__cph.m, x.__cph.u, x.status, x.responseType === '' || x.responseType === 'text' ? x.responseText : null, req); } catch (e) { /* 무시 */ } });
         return send.apply(this, arguments);
       };
     }
@@ -1673,7 +1689,10 @@
     out.push('', '[대화 기록 주소 시험] ' + (msgWay === null ? '아직 안 함(패널을 한 번 연 뒤 진단하세요)' : msgWay < 0 ? '모두 안 됨 → 화면 읽기' : '됨: ' + MSG_TRY[msgWay]('…')));
     probeLog.slice(-8).forEach((x) => out.push('- ' + x));
     out.push('', '[통신] (스크립트가 켜진 뒤 일어난 것. 메시지를 하나 보낸 뒤 진단하면 더 많이 잡혀요)');
-    seen.forEach((v, k) => out.push('- ' + k + ' → ' + v.status + (v.shape ? ' ' + JSON.stringify(v.shape).slice(0, /\/messages|chat-messages/.test(k) ? 1500 : 400) : '')));
+    seen.forEach((v, k) => {
+      out.push('- ' + k + ' → ' + v.status + (v.shape ? ' ' + JSON.stringify(v.shape).slice(0, /\/messages|chat-messages/.test(k) ? 1500 : 400) : ''));
+      if (v.req) out.push('    보냄: 헤더 [' + v.req.h.join(', ') + ']' + (v.req.cred ? ' credentials=' + v.req.cred : '') + (v.req.b ? ' 본문 ' + JSON.stringify(v.req.b).slice(0, 600) : ''));
+    });
     try {
       const res = performance.getEntriesByType('resource').filter((r) => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest');
       const rest = Array.from(new Set(res.map((r) => maskPath(r.name)))).filter((u) => !Array.from(seen.keys()).some((k) => k.endsWith(' ' + u)));
