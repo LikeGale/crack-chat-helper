@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         크랙 경과 정리기
 // @namespace    crack-progress-helper
-// @version      1.12.0
+// @version      1.12.1
 // @description  크랙 롤플레이의 턴 수를 세다가 경과를 정리할 때가 되면 알려 주고, 대화 기록을 AI에게 맡길 정리 요청 파일로 만들어 줍니다. AI 답을 붙여 넣으면 경과를 크랙 자동 장기기억 칸에 바로 넣고(되돌리기 가능), 상태창이 작품 원래 모양에서 벗어나면 알려 줍니다. 작품마다 설정을 따로 기억해 어느 작품에서나 씁니다.
 // @match        https://crack.wrtn.ai/*
 // @match        https://genit.ai/*
@@ -1467,22 +1467,125 @@
   // 젠잇의 내부 구조를 아직 모른다. 이번 버전은 정리기가 젠잇에서 켜지고, 설정 탭(또는 대화를 못 읽었다는 안내)의
   // '진단 복사'로 젠잇 화면 구조와 통신 주소를 모아 보내게 하는 데까지만 한다. 그 결과를 보고 대화 읽기·장기기억을 붙인다.
   // ---------------------------------------------------------------------------
-  const NOT_YET = '젠잇은 아직 시험 단계라 대화를 읽지 못해요. 진단 복사를 눌러 결과를 보내 주세요.';
+  const NOT_YET = '젠잇에서는 아직 이 기능을 쓸 수 없어요.';
   const notYet = () => { const e = new Error(NOT_YET); e.status = 0; throw e; };
+  const API = 'https://api.genit.ai/api/';
+  const rawFetch = W.fetch; // 아래 통신 기록용 감싸기 전 것
 
-  // 주소 첫 칸의 언어(/ko 등)는 뺀다. 목록·검색 화면이 아니고 채팅으로 보이는 주소면 그 주소를 채팅방 id로 쓴다
-  const LIST_PAGE = /^\/?(?:$|contents|search|login|signup|settings|my|mypage|notice|event)(?:\/|$)/;
+  // 채팅 화면 주소: /ko/chats/<채팅방>. 앞의 언어(/ko 등)는 뺀다
   function genitPath() { return location.pathname.replace(/^\/[a-z]{2}(?:-[A-Z]{2})?(?=\/|$)/, '') || '/'; }
-  function chatId() {
-    const p = genitPath();
-    if (LIST_PAGE.test(p)) return null;
-    const m = p.match(/\/(?:chats?|rooms?|conversations?|c)\/([\w-]+)/);
-    if (m) return m[1];
-    return document.querySelector('textarea,[contenteditable="true"]') ? p : null;
+  function chatId() { const m = genitPath().match(/^\/chats\/([\w-]+)/); return m ? m[1] : null; }
+
+  // 젠잇은 로그인 쿠키로 api.genit.ai와 주고받는다. 실패하면 status가 붙은 Error
+  async function api(method, url, body) {
+    let res;
+    try {
+      res = await rawFetch.call(W, url, { method, credentials: 'include', headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined });
+    } catch (e) { const err = new Error('네트워크 오류: ' + (e.message || e)); err.status = 0; throw err; }
+    const text = await res.text().catch(() => '');
+    if (!res.ok) { const err = new Error('젠잇 ' + res.status + (text ? ' (' + text.replace(/\s+/g, ' ').slice(0, 120) + ')' : '')); err.status = res.status; throw err; }
+    if (!text) return {};
+    try { return JSON.parse(text); } catch (e) { return {}; }
   }
-  function workIdOf(id) {
-    const m = genitPath().match(/\/(?:characters?|contents?|stories|story|works?|simulations?)\/([\w-]+)/);
-    return (m && m[1]) || id;
+
+  // 채팅방 정보: 작품(캐릭터) id·이름. 페르소나는 이 채팅방에 켜 둔 것
+  const sessions = new Map();
+  function session(id) {
+    if (!sessions.has(id)) sessions.set(id, api('GET', API + 'chat-sessions/' + id + '/').catch((e) => { sessions.delete(id); throw e; }));
+    return sessions.get(id);
+  }
+  const workIds = new Map();
+  function workIdOf(id) { return workIds.get(id) || id; }
+  const infos = new Map();
+  async function fetchInfo(id) {
+    const info = { name: '', persona: '' };
+    try {
+      const s = await session(id);
+      const ch = s.ai_character || {};
+      if (ch.id) workIds.set(id, String(ch.id));
+      info.name = String(ch.name || s.title || '');
+    } catch (e) { /* 빈 글자 */ }
+    try {
+      const r = await api('GET', API + 'chat-sessions/' + id + '/session-personas/');
+      const list = Array.isArray(r.results) ? r.results : [];
+      const on = list.find((x) => x.id === r.active_id) || list.find((x) => x.is_active);
+      if (on && on.name) info.persona = String(on.name);
+    } catch (e) { /* 빈 글자 */ }
+    infos.set(id, info);
+    return info;
+  }
+
+  // 대화 기록. 기록을 주는 주소를 아직 확인하지 못해, 그럴듯한 주소를 차례로 해 보고 되는 것을 기억한다.
+  // 모두 안 되면 화면에 떠 있는 대화를 읽는다(화면에 불러온 만큼만)
+  const MSG_TRY = [
+    (id) => API + 'chat-sessions/' + id + '/messages/',
+    (id) => API + 'chat-sessions/' + id + '/chat-messages/',
+    (id) => API + 'chat-messages/?session=' + id,
+    (id) => API + 'messages/?chat_session=' + id,
+  ];
+  let msgWay = null; // 되는 주소 번호, -1이면 화면 읽기
+  const probeLog = [];
+  const listOf = (r) => Array.isArray(r) ? r : Array.isArray(r.results) ? r.results : Array.isArray(r.messages) ? r.messages : (r.data && Array.isArray(r.data.messages)) ? r.data.messages : null;
+  function roleOf(m) {
+    const v = String(m.role || m.sender_type || m.sender || m.author_type || m.type || '').toLowerCase();
+    if (m.is_user === true || /^(user|human|me|player)$/.test(v)) return 'user';
+    if (m.is_user === false || /^(assistant|ai|bot|model|character|system_ai)$/.test(v)) return 'assistant';
+    return null;
+  }
+  const textOf = (m) => String(m.content != null ? m.content : m.text != null ? m.text : m.message != null ? m.message : m.body != null ? m.body : '');
+  function normalize(list) {
+    const out = [];
+    for (const m of list) {
+      if (!m || typeof m !== 'object') continue;
+      const role = roleOf(m);
+      if (!role) continue;
+      out.push({ id: String(m.id != null ? m.id : out.length), role, content: textOf(m), isPrologue: !!(m.is_prologue || m.is_greeting || m.is_first_message), at: Date.parse(m.created_at || m.createdAt || '') || 0 });
+    }
+    if (out.length > 1 && out.every((m) => m.at)) out.sort((x, y) => x.at - y.at); // 만든 시각이 다 있으면 오래된 것부터
+    return out.map(({ at, ...m }) => m);
+  }
+  async function viaApi(id, k, max) {
+    let url = MSG_TRY[k](id), raw = [];
+    for (let page = 0; url && page < 200; page++) {
+      const r = await api('GET', url);
+      const list = listOf(r);
+      if (!list) throw new Error('모양 다름');
+      if (page === 0 && list.length && !normalize(list).length) throw new Error('역할 못 읽음');
+      raw = raw.concat(list);
+      if (max > 0 && raw.length >= max) break;
+      url = typeof r.next === 'string' && /^https:\/\/api\.genit\.ai\//.test(r.next) ? r.next : null;
+    }
+    return normalize(raw);
+  }
+  // 화면 읽기: #chat-container 안의 메시지 묶음. 오른쪽으로 붙은(items-end) 것이 내 입력
+  function viaScreen() {
+    const box = document.getElementById('chat-container');
+    if (!box) throw new Error('화면에서 대화를 찾지 못했어요.');
+    const out = [];
+    box.querySelectorAll('div.space-y-3').forEach((g, i) => {
+      if (g.closest('#cph-wrap')) return;
+      const ai = g.querySelector('.markdown-content');
+      const me = g.querySelector('.items-end');
+      const node = ai || me;
+      if (!node) return;
+      const text = (node.innerText || node.textContent || '').trim();
+      if (text) out.push({ id: 'screen-' + i + '-' + text.length, role: ai ? 'assistant' : 'user', content: text, isPrologue: false });
+    });
+    if (!out.length) throw new Error('화면에서 대화를 찾지 못했어요.');
+    return out;
+  }
+  async function fetchLogs(id, max) {
+    let list = null;
+    if (msgWay === null || msgWay >= 0) {
+      const order = msgWay === null ? MSG_TRY.map((_, k) => k) : [msgWay];
+      for (const k of order) {
+        try { list = await viaApi(id, k, max); msgWay = k; probeLog.push(MSG_TRY[k]('…') + ' → 됨'); break; }
+        catch (e) { probeLog.push(MSG_TRY[k]('…') + ' → ' + (e.status != null ? e.status : '') + ' ' + (e.message || '').slice(0, 40)); }
+      }
+      if (!list && msgWay === null) msgWay = -1;
+    }
+    if (!list) list = viaScreen();
+    return max > 0 ? list.slice(-max) : list;
   }
 
   // 통신 기록: 젠잇이 부르는 주소와 답의 모양(이름만, 값은 안 남김). 스크립트가 켜진 뒤 일어난 요청만 잡힌다
@@ -1567,8 +1670,10 @@
       out.push('- ' + descr(g.n) + ' 안의 ' + descr(g.same[0]) + ' ×' + g.same.length + ', 글자 ' + g.textLen);
       g.same.slice(-2).forEach((k) => out.push('    · ' + snip(k.textContent) + ' | 속: ' + Array.from(k.querySelectorAll('*')).slice(0, 4).map(descr).join(' > ')));
     });
+    out.push('', '[대화 기록 주소 시험] ' + (msgWay === null ? '아직 안 함(패널을 한 번 연 뒤 진단하세요)' : msgWay < 0 ? '모두 안 됨 → 화면 읽기' : '됨: ' + MSG_TRY[msgWay]('…')));
+    probeLog.slice(-8).forEach((x) => out.push('- ' + x));
     out.push('', '[통신] (스크립트가 켜진 뒤 일어난 것. 메시지를 하나 보낸 뒤 진단하면 더 많이 잡혀요)');
-    seen.forEach((v, k) => out.push('- ' + k + ' → ' + v.status + (v.shape ? ' ' + JSON.stringify(v.shape).slice(0, 400) : '')));
+    seen.forEach((v, k) => out.push('- ' + k + ' → ' + v.status + (v.shape ? ' ' + JSON.stringify(v.shape).slice(0, /\/messages|chat-messages/.test(k) ? 1500 : 400) : '')));
     try {
       const res = performance.getEntriesByType('resource').filter((r) => r.initiatorType === 'fetch' || r.initiatorType === 'xmlhttprequest');
       const rest = Array.from(new Set(res.map((r) => maskPath(r.name)))).filter((u) => !Array.from(seen.keys()).some((k) => k.endsWith(' ' + u)));
@@ -1581,11 +1686,11 @@
     name: '젠잇',
     appName: '경과 정리기 (젠잇 시험판)',
     chatId,
-    workId: workIdOf,
-    fetchLogs: async () => notYet(),
-    fetchInfo: async () => ({ name: '', persona: '' }),
-    cachedInfo: () => null,
-    fetchMemory: async () => ({ list: [], partial: false }),
+    workId: workIdOf, // 캐릭터 id(채팅방 정보를 읽은 뒤부터). 그 전엔 채팅방 id
+    fetchLogs,
+    fetchInfo,
+    cachedInfo: (id) => infos.get(id) || null,
+    fetchMemory: async () => ({ list: [], partial: false }), // 젠잇 기억(로어북 등)은 아직 모름: 답은 복사해서 직접 넣는다
     patchMemory: async () => notYet(), deleteMemory: async () => notYet(), addMemory: async () => notYet(),
     refreshMemoryView: () => {},
     memoryViewOpen: () => false,
